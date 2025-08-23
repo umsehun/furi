@@ -154,23 +154,24 @@ class TextPreprocessor:
                         sents.extend(self._regex_split(chunk))
 
             return sents
+        # Fallback regex path: split paragraphs into sentences
         paragraphs = text.split('\n')
         sentences = []
-        
+
         for para in paragraphs:
             para = para.strip()
             if not para:
                 continue
-                
+
             # 먼저 명확한 문장 끝을 찾음
             matches = self.sentence_pattern.finditer(para)
             current_sentence = []
-            
+
             for match in matches:
                 sent = match.group().strip()
                 if not sent:
                     continue
-                    
+
                 # 문장이 너무 짧으면 다음 문장과 결합
                 if len(sent) < self.config.min_length and current_sentence:
                     current_sentence.append(sent)
@@ -181,22 +182,66 @@ class TextPreprocessor:
                             combined += '.'
                         sentences.append(combined)
                         current_sentence = []
-                    
+
                     if len(sent) >= self.config.min_length:
                         if not re.search(r'[.!?]$', sent):
                             sent += '.'
                         sentences.append(sent)
                     else:
                         current_sentence.append(sent)
-            
+
             # 남은 문장 처리
             if current_sentence:
                 combined = ' '.join(current_sentence)
                 if not re.search(r'[.!?]$', combined):
                     combined += '.'
                 sentences.append(combined)
-        
-        return sentences
+
+        # Now post-process the extracted sentences with aggressive splitting
+        sents = sentences
+        processed = []
+        # Heuristics: if sentence length > 40% of max_length, or contains many commas/conjunctions
+        comma_thresh = 1
+        conj_re = re.compile(r'그런데|하지만|그리고|근데|그래서|그러면')
+        max_len = self.config.max_length
+        for s in sents:
+            clean_ns_len = len(s.replace(' ', ''))
+            comma_count = s.count(',') + s.count('，')
+            if clean_ns_len > int(max_len * 0.4) or comma_count >= comma_thresh or conj_re.search(s):
+                parts = self._aggressive_split(s)
+                # If aggressive split returned only a single part but sentence is still
+                # clause-dense (above a higher threshold), force a midpoint split.
+                if len(parts) == 1 and clean_ns_len > int(max_len * 0.6):
+                    raw = parts[0]
+                    # find a split near the middle as a last resort
+                    raw_ns = raw.replace(' ', '')
+                    half = len(raw_ns) // 2
+                    search_window = 40
+                    start = max(0, half - search_window)
+                    end = min(len(raw), half + search_window)
+                    split_pos = None
+                    for i in range(start, end):
+                        if raw[i] in ',，;；.。!?':
+                            split_pos = i + 1
+                            break
+                    if split_pos is None:
+                        for i in range(end - 1, start - 1, -1):
+                            if raw[i].isspace():
+                                split_pos = i
+                                break
+                    if split_pos:
+                        a = raw[:split_pos].strip()
+                        b = raw[split_pos:].strip()
+                        parts = []
+                        if a:
+                            parts.append(a if re.search(r'[.!?]$', a) else a + '.')
+                        if b:
+                            parts.append(b if re.search(r'[.!?]$', b) else b + '.')
+                processed.extend(parts)
+            else:
+                processed.append(s)
+
+        return processed
 
     def split_long_sentence(self, sent: str) -> List[str]:
         """Split overly long sentences into smaller chunks by clause/punctuation.
@@ -261,6 +306,172 @@ class TextPreprocessor:
                 chunks[i] = c + '.'
 
         return chunks
+
+    def _aggressive_split(self, sent: str) -> List[str]:
+        """Try several lightweight, high-recall splits to break long monologues.
+        This is used after KSS/regex when sentences are still too long.
+        """
+        # 1) Strong punctuation split: ., ?, !, ~ (and fullwidth variants)
+        strong_re = re.compile(r'([\.\?!~。！？])')
+        tokens = [t for t in re.split(strong_re, sent) if t and t.strip()]
+        # recombine punctuation with previous fragment
+        segs = []
+        buf = ''
+        for tok in tokens:
+            if strong_re.fullmatch(tok):
+                # punctuation token: append to buffer and flush
+                buf = (buf + tok).strip()
+                segs.append(buf)
+                buf = ''
+            else:
+                if buf:
+                    segs.append(buf)
+                buf = tok
+        if buf:
+            segs.append(buf)
+
+        # if we got multiple strong-punct segments, return them (shortened)
+        if len(segs) > 1:
+            out = []
+            for s in segs:
+                s = s.strip()
+                if not re.search(r'[\.\?!~]$', s):
+                    s = s + '.'
+                out.append(s)
+            return out
+
+        # 2) Conjunction-aware split: split BEFORE conjunction and attach the conjunction
+        #    to the start of the following segment (so '... 그런데 ...' -> ['...', '그런데 ...'])
+        # 2a) Heuristic: split when a predicate-like ending is followed by a subject-marked noun
+        # e.g. '...속수무책이네 마비아가 가져온...' -> split between '이네' and '마비아가'
+        subj_change = re.search(r"(.{5,}?(?:이네|네요|습니다|다|요|군요|구나))\s+([가-힣]+(?:이|가|는|은)\b.*)", sent)
+        if subj_change:
+            a = subj_change.group(1).strip()
+            b = subj_change.group(2).strip()
+            parts = []
+            if a:
+                if not re.search(r'[\.\?!~]$', a):
+                    a = a + '.'
+                parts.append(a)
+            if b:
+                if not re.search(r'[\.\?!~]$', b):
+                    b = b + '.'
+                parts.append(b)
+            if len(parts) > 1:
+                return parts
+
+        conj_words = ['근데', '그리고', '하지만', '그래서', '그런데', '그러면']
+        conj_pattern = '(' + '|'.join(map(re.escape, conj_words)) + ')'
+        parts = [sent]
+        new_parts = []
+        for p in parts:
+            if len(p.replace(' ', '')) <= self.config.max_length:
+                new_parts.append(p)
+                continue
+            toks = [t for t in re.split(conj_pattern, p) if t and t.strip()]
+            if len(toks) <= 1:
+                new_parts.append(p)
+                continue
+            i = 0
+            buf = ''
+            while i < len(toks):
+                t = toks[i]
+                if t in conj_words:
+                    # attach to next
+                    if i + 1 < len(toks):
+                        nxt = toks[i + 1].strip()
+                        if buf:
+                            new_parts.append(buf.strip())
+                            buf = ''
+                        new_parts.append((t + ' ' + nxt).strip())
+                        i += 2
+                    else:
+                        # conj at end
+                        buf = (buf + ' ' + t).strip()
+                        i += 1
+                else:
+                    if buf:
+                        buf = (buf + ' ' + t).strip()
+                    else:
+                        buf = t
+                    i += 1
+            if buf:
+                new_parts.append(buf.strip())
+        parts = new_parts if new_parts else parts
+
+        # 3) Clause-marker heuristic split (meaning-unit): split around common clause endings
+        clause_markers = ['는데', '지만', '면서', '면서도', '아서', '어서', '도록', '하면', '어서도']
+        out = []
+        for p in parts:
+            if len(p.replace(' ', '')) <= self.config.max_length:
+                out.append(p)
+                continue
+            toks = [t for t in re.split('(' + '|'.join(map(re.escape, clause_markers)) + ')', p) if t and t.strip()]
+            if len(toks) <= 1:
+                out.append(p)
+                continue
+            i = 0
+            while i < len(toks):
+                if i + 1 < len(toks) and toks[i + 1] in clause_markers:
+                    merged = (toks[i] + toks[i + 1]).strip()
+                    out.append(merged)
+                    i += 2
+                else:
+                    out.append(toks[i].strip())
+                    i += 1
+
+        # enforce max length and final punctuation; if still too long, midpoint-split fallback
+        final = []
+        for seg in out:
+            seg = seg.strip()
+            if not seg:
+                continue
+            if len(seg.replace(' ', '')) <= self.config.max_length:
+                if not re.search(r'[\.\?!~]$', seg):
+                    seg = seg + '.'
+                final.append(seg)
+                continue
+
+            # midpoint split near punctuation or whitespace
+            raw = seg
+            raw_ns = raw.replace(' ', '')
+            half = len(raw_ns) // 2
+            search_window = 40
+            start = max(0, half - search_window)
+            end = min(len(raw), half + search_window)
+            split_pos = None
+            for i in range(start, end):
+                if raw[i] in ',，;；.。.。!?~':
+                    split_pos = i + 1
+                    break
+            if split_pos is None:
+                for i in range(end - 1, start - 1, -1):
+                    if raw[i].isspace():
+                        split_pos = i
+                        break
+            if split_pos is None:
+                idx = 0
+                while idx < len(raw):
+                    piece = raw[idx: idx + self.config.max_length].strip()
+                    if piece:
+                        if not re.search(r'[\.\?!~]$', piece):
+                            piece = piece + '.'
+                        final.append(piece)
+                    idx += self.config.max_length
+            else:
+                a = raw[:split_pos].strip()
+                b = raw[split_pos:].strip()
+                if a:
+                    if not re.search(r'[\.\?!~]$', a):
+                        a = a + '.'
+                    final.append(a)
+                if b:
+                    if not re.search(r'[\.\?!~]$', b):
+                        b = b + '.'
+                    final.append(b)
+
+        return final
+
     
     def is_valid_sentence(self, text: str) -> bool:
         """Enhanced sentence validation with better Korean ratio check."""
@@ -331,6 +542,24 @@ class TextPreprocessor:
                     combined += '.'
                 sentences.append(combined)
         return sentences
+
+    def build_turns(self, sentences: List[str], max_sent_per_turn: int = 2) -> List[str]:
+        """Group adjacent sentences into conversational 'turns'.
+        This reduces mismatch when a single content block lacks explicit speaker labels.
+        """
+        turns: List[str] = []
+        buf: List[str] = []
+        for s in sentences:
+            buf.append(s)
+            # if buffer reached capacity or sentence ends with strong punctuation, flush
+            if len(buf) >= max_sent_per_turn:
+                turns.append(' '.join(buf).strip())
+                buf = []
+        if buf:
+            turns.append(' '.join(buf).strip())
+        # Filter out turns that are too short
+        good_turns = [t for t in turns if len(re.sub(r'\s+', '', t)) >= 5]
+        return good_turns
     
     def create_sample(self, text: str) -> Dict[str, Any]:
         """Create a simple text sample."""
@@ -390,7 +619,16 @@ class TextPreprocessor:
             candidates = [sent]
             sent_ns = sent.replace(' ', '')
             if len(sent_ns) > self.config.max_length:
+                # First try clause-aware splitting
                 candidates = self.split_long_sentence(sent)
+                # If still too long, try aggressive splitting
+                new_cands = []
+                for cc in candidates:
+                    if len(cc.replace(' ', '')) > self.config.max_length:
+                        new_cands.extend(self._aggressive_split(cc))
+                    else:
+                        new_cands.append(cc)
+                candidates = new_cands
 
             for c in candidates:
                 c = c.strip()
@@ -442,10 +680,55 @@ class TextPreprocessor:
         # Create adjacent user->assistant pairs and append
         if pair_path and len(valid_sentences) >= 2:
             try:
-                with open(pair_path, 'a', encoding='utf-8') as pf:
-                    for a, b in zip(valid_sentences, valid_sentences[1:]):
-                        pair_obj = {"user": a, "assistant": b}
-                        pf.write(json.dumps(pair_obj, ensure_ascii=False) + '\n')
+                # Group sentences into conversational turns to reduce mismatch
+                turns = self.build_turns(valid_sentences, max_sent_per_turn=2)
+
+                # If only one turn exists, try to split it into two parts to form a pair
+                if len(turns) == 1:
+                    lone = turns[0]
+                    lone_ns = len(lone.replace(' ', ''))
+                    # Prefer aggressive split
+                    parts = self._aggressive_split(lone)
+                    if len(parts) == 1 and lone_ns > int(self.config.max_length * 0.5):
+                        # force a midpoint split
+                        raw = parts[0]
+                        raw_ns = raw.replace(' ', '')
+                        half = len(raw_ns) // 2
+                        search_window = 40
+                        start = max(0, half - search_window)
+                        end = min(len(raw), half + search_window)
+                        split_pos = None
+                        for i in range(start, end):
+                            if raw[i] in ',，;；.。!?':
+                                split_pos = i + 1
+                                break
+                        if split_pos is None:
+                            for i in range(end - 1, start - 1, -1):
+                                if raw[i].isspace():
+                                    split_pos = i
+                                    break
+                        if split_pos:
+                            a = raw[:split_pos].strip()
+                            b = raw[split_pos:].strip()
+                            parts = []
+                            if a:
+                                parts.append(a if re.search(r'[.!?]$', a) else a + '.')
+                            if b:
+                                parts.append(b if re.search(r'[.!?]$', b) else b + '.')
+
+                    # If we have at least two parts, build pair from first two
+                    if len(parts) >= 2:
+                        with open(pair_path, 'a', encoding='utf-8') as pf:
+                            pair_obj = {"user": parts[0], "assistant": parts[1]}
+                            pf.write(json.dumps(pair_obj, ensure_ascii=False) + '\n')
+                    else:
+                        # fallback: no pair created
+                        logging.debug('Single turn present but unable to split into pair; skipping pair creation')
+                else:
+                    with open(pair_path, 'a', encoding='utf-8') as pf:
+                        for a, b in zip(turns, turns[1:]):
+                            pair_obj = {"user": a, "assistant": b}
+                            pf.write(json.dumps(pair_obj, ensure_ascii=False) + '\n')
             except Exception as e:
                 logging.error(f"Failed to append to pair file {pair_path}: {e}")
 
