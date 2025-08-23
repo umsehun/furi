@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Model checkpoints and cache
+checkpoints/
+cache/
+*.pt
+*.bin
+
+# Logs
+logs/
+*.log
+
+# Test coverage
+.coverage
+htmlcov/
+
+# Poetry
+poetry.lock
+
+# Data
+data/
+*.json
+*.jsonl
+*.txt
+!requirements.txt
+!pyproject.toml
+
+# CUDA
+*.cu.o
+*.ptx

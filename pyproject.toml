@@ -1,0 +1,43 @@
+[tool.poetry]
+name = "qwen-train"
+version = "0.1.0"
+description = "Qwen 2.5 3B Fine-tuning with QLoRA"
+authors = ["Your Name <your.email@example.com>"]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.12"
+torch = ">=2.1.0"
+transformers = ">=4.36.0"
+peft = ">=0.7.0"
+bitsandbytes = ">=0.41.1"
+accelerate = ">=0.24.0"
+flash-attn = ">=2.3.0"
+numpy = ">=1.24.0"
+tqdm = ">=4.65.0"
+datasets = ">=2.14.0"
+
+[tool.poetry.group.dev.dependencies]
+black = "^23.12.0"
+isort = "^5.13.0"
+mypy = "^1.7.0"
+pytest = "^7.4.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+check_untyped_defs = true
