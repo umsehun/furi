@@ -4,9 +4,71 @@ from pathlib import Path
 import json
 import re
 import logging
+import concurrent.futures
+import multiprocessing
 import time
 from typing import List, Dict, Any, Generator
 from dataclasses import dataclass
+import concurrent.futures
+import warnings
+# Defer importing kss until needed to avoid kss emitting messages at module import time.
+_kss = None
+
+
+def _kss_split_worker(text: str, backend: str = ''):
+    """Module-level worker to call kss.split_sentences in a subprocess (picklable).
+    It attempts to suppress kss messages by temporarily redirecting stdout/stderr.
+    """
+    try:
+        import kss as _kss_local  # type: ignore
+        import sys, os
+        null = open(os.devnull, 'w')
+        old_out, old_err = sys.stdout, sys.stderr
+        try:
+            sys.stdout = null
+            sys.stderr = null
+            try:
+                if backend:
+                    return _kss_local.split_sentences(text, backend=backend)
+                return _kss_local.split_sentences(text)
+            except TypeError:
+                return _kss_local.split_sentences(text)
+        finally:
+            sys.stdout = old_out
+            sys.stderr = old_err
+            null.close()
+    except Exception:
+        raise
+
+
+def iter_chunks(text: str, max_len: int = 2000):
+    """Yield smaller chunks from text to avoid backend blowups.
+    Strategy: split by double-newline paragraphs, then by sentence punctuation
+    to keep chunks under max_len characters.
+    """
+    if not text:
+        return
+    # First split on double newlines (paragraphs)
+    paras = re.split(r'\n{2,}', text)
+    for para in paras:
+        para = para.strip()
+        if not para:
+            continue
+        if len(para) <= max_len:
+            yield para
+            continue
+
+        # Fallback: split by sentence punctuation while preserving separators
+        parts = re.split(r'([.!?。！？\n])', para)
+        buf = ''
+        for seg in parts:
+            buf += seg
+            if len(buf) >= max_len:
+                yield buf
+                buf = ''
+        if buf:
+            yield buf
+
 
 @dataclass
 class PreprocessConfig:
@@ -15,19 +77,26 @@ class PreprocessConfig:
     max_length: int = 150  # 최대 150자로 늘림
     remove_urls: bool = True
     output_prefix: str = "f.dataset"
+    use_kss: bool = False
+    kss_timeout: int = 15  # seconds to wait for kss before falling back
+    kss_backend: str = ''
+    kss_chunk_size: int = 2000
 
 class TextPreprocessor:
     """Sequential text preprocessor for Korean dialogue data."""
-    
+
     def __init__(self, config: PreprocessConfig):
         """Initialize preprocessor with config."""
         self.config = config
-        
+
+        # optional kss sentence splitter (lazy import handled elsewhere)
+        self.kss = _kss if (self.config.use_kss and _kss is not None) else None
+
         # Compile regex patterns
         self.url_pattern = re.compile(
             r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
         )
-        self.noise_pattern = re.compile(r'[^\w\s가-힣.,!?()\'"-]')
+        self.noise_pattern = re.compile(r"[^\w\s가-힣.,!?()'\"-]")
         self.space_pattern = re.compile(r'\s+')
         # 개선된 문장 패턴: 따옴표 내부와 일반 문장, 중간 구두점도 포함
         self.sentence_pattern = re.compile(
@@ -53,7 +122,38 @@ class TextPreprocessor:
         return text.strip()
     
     def split_sentences(self, text: str) -> List[str]:
-        """Enhanced sentence splitting with better handling of quotes and punctuation."""
+        """Enhanced sentence splitting with better handling of quotes and punctuation.
+        If kss is enabled and available, use it for higher-quality splitting.
+        """
+        # Use kss if available, but process the input in smaller chunks and
+        # run each chunk in a short-lived subprocess to avoid pecab overflow/hangs.
+        if self.kss:
+            sents = []
+            timeout = getattr(self.config, 'kss_timeout', 15)
+            chunk_size = getattr(self.config, 'kss_chunk_size', 2000)
+            backend = getattr(self.config, 'kss_backend', '')
+            with concurrent.futures.ProcessPoolExecutor(max_workers=1) as exe:
+                for chunk in iter_chunks(text, max_len=chunk_size):
+                    future = exe.submit(_kss_split_worker, chunk, backend)
+                    try:
+                        raw = future.result(timeout=timeout)
+                        for s in raw:
+                            s = s.strip()
+                            if not s:
+                                continue
+                            if not re.search(r'[.!?]$', s):
+                                s = s + '.'
+                            sents.append(s)
+                    except concurrent.futures.TimeoutError:
+                        logging.warning(
+                            f"KSS split_sentences timed out after {timeout} seconds on a chunk; falling back to regex for that chunk"
+                        )
+                        sents.extend(self._regex_split(chunk))
+                    except Exception as e:
+                        logging.warning(f'KSS processing raised exception for chunk: {e}; falling back to regex')
+                        sents.extend(self._regex_split(chunk))
+
+            return sents
         paragraphs = text.split('\n')
         sentences = []
         
@@ -125,14 +225,29 @@ class TextPreprocessor:
                     chunks.append(current)
                 # If single part itself too long, slice it
                 if len(p.replace(' ', '')) > max_len:
-                    raw = p.replace('\n', ' ')
-                    # slice by characters (preserve spaces roughly)
-                    idx = 0
-                    clean = raw
-                    while idx < len(clean):
-                        piece = clean[idx: idx + max_len]
+                    # Try splitting by spaces (word-aware) to avoid breaking words
+                    words = p.replace('\n', ' ').split()
+                    piece = ''
+                    for w in words:
+                        candidate = (piece + ' ' + w).strip() if piece else w
+                        if len(candidate.replace(' ', '')) <= max_len:
+                            piece = candidate
+                        else:
+                            if piece:
+                                chunks.append(piece.strip())
+                            # if single word too long, fallback to char slice
+                            if len(w.replace(' ', '')) > max_len:
+                                raw = w
+                                idx = 0
+                                while idx < len(raw):
+                                    chunk_piece = raw[idx: idx + max_len]
+                                    chunks.append(chunk_piece.strip())
+                                    idx += max_len
+                                piece = ''
+                            else:
+                                piece = w
+                    if piece:
                         chunks.append(piece.strip())
-                        idx += max_len
                     current = ''
                 else:
                     current = p
@@ -180,6 +295,42 @@ class TextPreprocessor:
             return False
             
         return True
+
+    def _regex_split(self, text: str) -> List[str]:
+        """Fallback regex-based splitter used when kss fails or times out."""
+        paragraphs = text.split('\n')
+        sentences: List[str] = []
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+            matches = self.sentence_pattern.finditer(para)
+            current_sentence = []
+            for match in matches:
+                sent = match.group().strip()
+                if not sent:
+                    continue
+                if len(sent) < self.config.min_length and current_sentence:
+                    current_sentence.append(sent)
+                else:
+                    if current_sentence:
+                        combined = ' '.join(current_sentence)
+                        if not re.search(r'[.!?]$', combined):
+                            combined += '.'
+                        sentences.append(combined)
+                        current_sentence = []
+                    if len(sent) >= self.config.min_length:
+                        if not re.search(r'[.!?]$', sent):
+                            sent += '.'
+                        sentences.append(sent)
+                    else:
+                        current_sentence.append(sent)
+            if current_sentence:
+                combined = ' '.join(current_sentence)
+                if not re.search(r'[.!?]$', combined):
+                    combined += '.'
+                sentences.append(combined)
+        return sentences
     
     def create_sample(self, text: str) -> Dict[str, Any]:
         """Create a simple text sample."""
@@ -209,7 +360,9 @@ class TextPreprocessor:
         output_dir: Path,
         start_index: int,
         show_samples: bool = True,
-        existing_texts: set = None
+        existing_texts: set = None,
+        content_path: Path = None,
+        pair_path: Path = None
     ) -> int:
         """Process a single text file and return next index."""
         try:
@@ -218,18 +371,19 @@ class TextPreprocessor:
         except Exception as e:
             logging.error(f"Failed to read {file_path}: {e}")
             return start_index
-        
+
         # Clean and split text
         text = self.clean_text(text)
         sentences = self.split_sentences(text)
-        
+
         # Filter and save valid sentences
         current_index = start_index
         valid_count = 0
         total_count = len(sentences)
-        
+        valid_sentences = []
+
         logging.info(f"\nProcessing {file_path.name} ({total_count} sentences)...")
-        
+
         for sent in sentences:
             sent = sent.strip()
             # If too long, split into chunks
@@ -248,8 +402,10 @@ class TextPreprocessor:
                     continue
 
                 if self.is_valid_sentence(c):
+                    # collect valid sentences for aggregated outputs
+                    valid_sentences.append(c)
+
                     output_path = self.get_output_path(output_dir, current_index)
-                    
                     if self.save_sentence(c, output_path):
                         # Add to existing_texts to avoid duplicates within same run
                         if existing_texts is not None:
@@ -265,19 +421,39 @@ class TextPreprocessor:
                             logging.info(
                                 f"[{current_index}] Generated: {output_path.name}"
                             )
-                        
+
                         valid_count += 1
                         current_index += 1
-        
+
         logging.info(
             f"Completed {file_path.name}: "
             f"{valid_count} valid sentences from {total_count} total\n"
             f"{'=' * 50}\n"
         )
+        # Append valid sentences to aggregated content file
+        if content_path and valid_sentences:
+            try:
+                with open(content_path, 'a', encoding='utf-8') as cf:
+                    for s in valid_sentences:
+                        cf.write(json.dumps({"role":"content","content":s}, ensure_ascii=False) + '\n')
+            except Exception as e:
+                logging.error(f"Failed to append to content file {content_path}: {e}")
+
+        # Create adjacent user->assistant pairs and append
+        if pair_path and len(valid_sentences) >= 2:
+            try:
+                with open(pair_path, 'a', encoding='utf-8') as pf:
+                    for a, b in zip(valid_sentences, valid_sentences[1:]):
+                        pair_obj = {"user": a, "assistant": b}
+                        pf.write(json.dumps(pair_obj, ensure_ascii=False) + '\n')
+            except Exception as e:
+                logging.error(f"Failed to append to pair file {pair_path}: {e}")
+
         return current_index
 
 def main():
     """Main execution function."""
+    global _kss
     parser = argparse.ArgumentParser(
         description='Korean dialogue preprocessor (sequential processing)'
     )
@@ -311,6 +487,56 @@ def main():
         default='',
         help='Comma-separated filenames or indices to process (e.g. "1,3-5" or "clo_f.txt,hagun_f.txt"). If empty, script will prompt interactively.'
     )
+    parser.add_argument(
+        '--use_kss',
+        action='store_true',
+        help='Use KSS for sentence splitting if available'
+    )
+    parser.add_argument(
+        '--force-regex',
+        dest='force_regex',
+        action='store_true',
+        help='Force regex-based splitting and disable KSS even if --use_kss is passed'
+    )
+    parser.add_argument(
+        '--content_file',
+        type=str,
+        default='content_only.jsonl',
+        help='Aggregated content-only output JSONL filename'
+    )
+    parser.add_argument(
+        '--pair_file',
+        type=str,
+        default='pairs.jsonl',
+        help='Aggregated user-assistant pair output JSONL filename'
+    )
+    parser.add_argument(
+        '--start-index',
+        dest='start_index',
+        type=int,
+        default=None,
+        help='Force starting index (1-based). If provided, numbering will start from this value and not resume from existing files.'
+    )
+    parser.add_argument(
+        '--overwrite',
+        dest='overwrite',
+        action='store_true',
+        help='When set, do not skip sentences found in existing outputs and allow writing from the start index (may overwrite files).'
+    )
+    parser.add_argument(
+        '--kss-backend',
+        dest='kss_backend',
+        type=str,
+        default='',
+        help='Preferred kss backend (e.g. "mecab"). If empty, kss will auto-detect.'
+    )
+    parser.add_argument(
+        '--kss-chunk-size',
+        dest='kss_chunk_size',
+        type=int,
+        default=2000,
+        help='Max characters per chunk fed to KSS to avoid backend blowups.'
+    )
     args = parser.parse_args()
     
     # Setup logging
@@ -320,11 +546,27 @@ def main():
     )
     
     # Initialize preprocessor
+    # If user requests force-regex, disable kss regardless of --use_kss
+    if getattr(args, 'force_regex', False):
+        logging.info('Force-regex enabled: KSS will be ignored and regex splitting will be used')
+
     config = PreprocessConfig(
         min_length=args.min_length,
-        max_length=args.max_length
+        max_length=args.max_length,
+        use_kss=(args.use_kss and not getattr(args, 'force_regex', False)),
+        kss_backend=args.kss_backend or '',
+        kss_chunk_size=getattr(args, 'kss_chunk_size', 2000)
     )
     processor = TextPreprocessor(config)
+    # Lazy-load kss module only when use_kss is True and not force-regex
+    if config.use_kss and _kss is None:
+        try:
+            import kss as _kss_mod  # type: ignore
+            _kss = _kss_mod
+            processor.kss = _kss
+            logging.info('kss module loaded for sentence splitting')
+        except Exception as e:
+            logging.warning(f'Failed to import kss: {e}; falling back to regex')
     
     # Setup directories
     input_dir = Path(args.input_dir)
@@ -406,44 +648,56 @@ def main():
             logging.error('No files selected. Exiting.')
             return
 
-    # Determine start index from existing output files to avoid overwriting
+    # Determine start index from existing output files to avoid overwriting,
+    # unless the user forces a start index with --start-index.
     existing = sorted(output_dir.glob(f"{config.output_prefix}*.jsonl"))
-    if existing:
-        max_idx = 0
-        for p in existing:
-            name = p.stem  # e.g. f.dataset_12
-            parts = name.split('_')
-            if len(parts) == 1:
-                # base file: f.dataset
-                idx = 1
-            else:
-                try:
-                    idx = int(parts[-1])
-                except Exception:
-                    idx = 0
-            if idx > max_idx:
-                max_idx = idx
-        current_index = max_idx + 1
-        logging.info(f"Resuming output numbering at {current_index} (found {len(existing)} existing files)")
+    if args.start_index is not None and args.start_index > 0:
+        current_index = args.start_index
+        logging.info(f"Forced start index set to {current_index} by --start-index")
     else:
-        current_index = 1
-    # Collect existing texts to avoid duplicates
-    existing_texts = set()
-    for p in existing:
-        try:
-            with open(p, 'r', encoding='utf-8') as fh:
-                for line in fh:
+        if existing:
+            max_idx = 0
+            for p in existing:
+                name = p.stem  # e.g. f.dataset_12
+                parts = name.split('_')
+                if len(parts) == 1:
+                    # base file: f.dataset
+                    idx = 1
+                else:
                     try:
-                        obj = json.loads(line.strip())
-                        if isinstance(obj, dict) and 'text' in obj:
-                            existing_texts.add(obj['text'].strip())
+                        idx = int(parts[-1])
                     except Exception:
-                        continue
-        except Exception:
-            continue
+                        idx = 0
+                if idx > max_idx:
+                    max_idx = idx
+            current_index = max_idx + 1
+            logging.info(f"Resuming output numbering at {current_index} (found {len(existing)} existing files)")
+        else:
+            current_index = 1
+    # Collect existing texts to avoid duplicates (unless overwrite requested)
+    existing_texts = set() if not getattr(args, 'overwrite', False) else None
+    if existing_texts is not None:
+        for p in existing:
+            try:
+                with open(p, 'r', encoding='utf-8') as fh:
+                    for line in fh:
+                        try:
+                            obj = json.loads(line.strip())
+                            if isinstance(obj, dict) and 'text' in obj:
+                                existing_texts.add(obj['text'].strip())
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+    else:
+        logging.info('Overwrite enabled: existing sentence deduplication disabled; files may be overwritten')
     total_files = len(selected)
     logging.info(f"Processing {total_files} selected files")
     logging.info('=' * 50)
+
+    # Prepare aggregated output paths
+    content_path = output_dir / args.content_file
+    pair_path = output_dir / args.pair_file
 
     for i, filename in enumerate(selected, 1):
         file_path = input_dir / filename
@@ -457,7 +711,9 @@ def main():
             output_dir,
             current_index,
             show_samples=(i == 1),  # 첫 번째 파일만 샘플 표시
-            existing_texts=existing_texts
+            existing_texts=existing_texts,
+            content_path=content_path,
+            pair_path=pair_path
         )
         time.sleep(0.5)
     
