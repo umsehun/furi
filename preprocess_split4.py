@@ -1,4 +1,4 @@
-"""Korean dialogue text preprocessor with sequential file processing."""
+"""Korean dialogue text preprocessor with sequential file processing and enhanced clause-aware splitting."""
 import argparse
 from pathlib import Path
 import json
@@ -121,6 +121,110 @@ class TextPreprocessor:
         
         return text.strip()
     
+    def clause_aware_split(self, sent: str) -> List[str]:
+        """Try clause-aware, connective-aware splitting for long or missing-punctuation sentences.
+        This function looks for natural Korean clause boundaries (conjunctions, clause markers,
+        connective phrases, and subject-change hints) and splits there. It guarantees that
+        each returned fragment ends with sentence punctuation and filters/merges tiny fragments.
+        """
+        max_len = self.config.max_length
+        s = sent.strip()
+        if not s:
+            return []
+        # If already short enough and ends with punctuation, return as-is
+        if len(s.replace(' ', '')) <= max_len and re.search(r'[.!?]$', s):
+            return [s]
+
+        # Candidate split patterns: conjunctions, clause markers, connective phrases
+        conj_words = ['근데', '그래서', '그리고', '하지만', '그런데', '그러면', '또는', '다만']
+        clause_markers = ['는데', '지만', '면서', '면서도', '아서', '어서', '도록', '하면', '어서도', '니까', '면', '때문에']
+        trans_phrases = ['결국', '사실', '정말로', '다시 말해']
+
+        # Build combined regex to find split points but keep the marker with the following clause
+        # We prefer splitting before conjunctions and right after clause markers.
+        conj_pattern = '(' + '|'.join(map(re.escape, conj_words)) + ')'
+        clause_pattern = '(' + '|'.join(map(re.escape, clause_markers)) + ')'
+
+        # First, try to split by explicit punctuation (., ?, !) preserving them
+        parts = []
+        if re.search(r'[.!?。！？]$', s) is None and any(w in s for w in clause_markers + conj_words + trans_phrases):
+            # split around clause markers keeping markers at end of left fragment
+            toks = [t for t in re.split('(' + '|'.join(map(re.escape, clause_markers + conj_words + trans_phrases)) + ')', s) if t and t.strip()]
+            # merge tokens into readable fragments
+            buf = ''
+            for tok in toks:
+                tok = tok.strip()
+                if tok in conj_words + trans_phrases:
+                    # attach conjunction to next fragment (start of next)
+                    if buf:
+                        # flush current buffer first
+                        parts.append(buf.strip())
+                        buf = ''
+                    buf = tok
+                elif tok in clause_markers:
+                    # clause marker: attach to previous fragment
+                    if buf:
+                        buf = (buf + tok).strip()
+                        parts.append(buf)
+                        buf = ''
+                    else:
+                        # nothing buffered, treat as fragment
+                        parts.append(tok)
+                else:
+                    if buf:
+                        # if buffer contains a conjunction, prepend it
+                        candidate = (buf + ' ' + tok).strip()
+                        parts.append(candidate)
+                        buf = ''
+                    else:
+                        parts.append(tok)
+        else:
+            # fallback: try splitting by commas and semicolons
+            parts = [p.strip() for p in re.split(r'[,，;；·—\n]+', s) if p and p.strip()]
+
+        # Post-process: ensure fragments end with punctuation and not too short
+        final = []
+        for p in parts:
+            if not p:
+                continue
+            piece = p.strip()
+            if not re.search(r'[.!?]$', piece):
+                piece = piece + '.'
+            final.append(piece)
+
+        # Merge too-short fragments (< min_length) with neighbors
+        merged = []
+        for frag in final:
+            if not merged:
+                merged.append(frag)
+                continue
+            last = merged[-1]
+            if len(frag.replace(' ', '')) < self.config.min_length:
+                # attach to previous
+                merged[-1] = (last.rstrip('.!?') + ' ' + frag).strip()
+                if not re.search(r'[.!?]$', merged[-1]):
+                    merged[-1] = merged[-1] + '.'
+            else:
+                merged.append(frag)
+
+        # Enforce max length: if any fragment still too long, delegate to existing splitters
+        out = []
+        for m in merged:
+            if len(m.replace(' ', '')) > max_len:
+                # try split_long_sentence then aggressive split as last resort
+                tmp = self.split_long_sentence(m)
+                new_tmp = []
+                for t in tmp:
+                    if len(t.replace(' ', '')) > max_len:
+                        new_tmp.extend(self._aggressive_split(t))
+                    else:
+                        new_tmp.append(t)
+                out.extend(new_tmp)
+            else:
+                out.append(m)
+
+        return out
+    
     def split_sentences(self, text: str) -> List[str]:
         """Enhanced sentence splitting with better handling of quotes and punctuation.
         If kss is enabled and available, use it for higher-quality splitting.
@@ -200,14 +304,35 @@ class TextPreprocessor:
         # Now post-process the extracted sentences with aggressive splitting
         sents = sentences
         processed = []
-        # Heuristics: if sentence length > 40% of max_length, or contains many commas/conjunctions
-        comma_thresh = 1
+        # Heuristics: be more sensitive — trigger aggressive splitting at a lower
+        # fraction of max_length because many Korean lines are long without
+        # explicit punctuation. Also treat any comma as a hint.
+        comma_thresh = 0
         conj_re = re.compile(r'그런데|하지만|그리고|근데|그래서|그러면')
+        # lower threshold fraction to make splitting more aggressive
         max_len = self.config.max_length
+        aggressive_frac = 0.25
         for s in sents:
             clean_ns_len = len(s.replace(' ', ''))
             comma_count = s.count(',') + s.count('，')
-            if clean_ns_len > int(max_len * 0.4) or comma_count >= comma_thresh or conj_re.search(s):
+            # If sentence exceeds a small fraction of max_len, try clause-aware
+            # splitting first (more deterministic than pure heuristics).
+            if clean_ns_len > int(max_len * aggressive_frac):
+                # early try clause-aware splitting to break long monologues
+                parts = self.clause_aware_split(s)
+                # if clause_aware_split did not produce results, fallback
+                if not parts:
+                    parts = self.split_long_sentence(s)
+                # if clause-aware did not reduce size sufficiently, apply aggressive split
+                new_parts = []
+                for p in parts:
+                    if len(p.replace(' ', '')) > max_len or (p.count(',') + p.count('，')) > 0 or conj_re.search(p):
+                        new_parts.extend(self._aggressive_split(p))
+                    else:
+                        new_parts.append(p)
+                parts = new_parts
+                processed.extend(parts)
+            elif clean_ns_len > int(max_len * 0.4) or comma_count >= comma_thresh or conj_re.search(s):
                 parts = self._aggressive_split(s)
                 # If aggressive split returned only a single part but sentence is still
                 # clause-dense (above a higher threshold), force a midpoint split.
@@ -620,7 +745,9 @@ class TextPreprocessor:
             sent_ns = sent.replace(' ', '')
             if len(sent_ns) > self.config.max_length:
                 # First try clause-aware splitting
-                candidates = self.split_long_sentence(sent)
+                candidates = self.clause_aware_split(sent)
+                if not candidates:
+                    candidates = self.split_long_sentence(sent)
                 # If still too long, try aggressive splitting
                 new_cands = []
                 for cc in candidates:
@@ -820,6 +947,12 @@ def main():
         default=2000,
         help='Max characters per chunk fed to KSS to avoid backend blowups.'
     )
+    parser.add_argument(
+        '--selftest',
+        dest='selftest',
+        action='store_true',
+        help='Run internal clause-aware self test on a few example sentences and exit.'
+    )
     args = parser.parse_args()
     
     # Setup logging
@@ -841,6 +974,25 @@ def main():
         kss_chunk_size=getattr(args, 'kss_chunk_size', 2000)
     )
     processor = TextPreprocessor(config)
+
+    # If selftest requested, run clause_aware_split on sample lines and exit
+    if getattr(args, 'selftest', False):
+        samples = [
+            "게다가 전투피에도 운명판정 카드 운이 나쁘면 그냥 다.",
+            "게다가 전투피에도 운명판정 카드 운이 나쁘면 그냥 다",
+            "이제 우리는 전장을 향해 가고, 적은 이미 포진해 있다. 그러나 상황은 복잡하고, 우리는 선택해야 한다",
+            "속수무책이네 마비아가 가져온 물건 때문에 상황이 악화되었다"
+        ]
+        print('\nSelf-test: clause_aware_split results\n' + ('-' * 40))
+        for s in samples:
+            cleaned = processor.clean_text(s)
+            res = processor.clause_aware_split(cleaned)
+            print(f"ORIG: {s}")
+            for r in res:
+                print(f" -> {r}")
+            print('-' * 20)
+        return
+    
     # Lazy-load kss module only when use_kss is True and not force-regex
     if config.use_kss and _kss is None:
         try:
