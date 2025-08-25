@@ -39,7 +39,7 @@ htmlcov/
 poetry.lock
 
 # Data
-data/
+
 *.json
 *.jsonl
 *.txt
