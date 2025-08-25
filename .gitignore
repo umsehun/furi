@@ -38,11 +38,10 @@ htmlcov/
 # Poetry
 poetry.lock
 
-# Data
 
-*.json
-*.jsonl
-*.txt
+
+
+
 !requirements.txt
 !pyproject.toml
 
